@@ -1,0 +1,5 @@
+# ignore txt files,
+*.txt
+*.jar
+# except foo.txt which is maintained by hand
+!foo.txt

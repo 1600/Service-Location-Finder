@@ -1,0 +1,109 @@
+# -*- coding: utf-8 -*-
+import httplib2
+import urllib
+import urllib2
+import ssl
+import json
+import rethinkdb as r
+import tldextract
+import socket
+import pika
+import time
+import Queue
+import dns.resolver
+
+
+# ip -> 地区 阿里云API
+host = 'https://dm-81.data.aliyun.com'
+path = '/rest/160601/ip/getIpInfo.json'
+appcode = '***REMOVED***'
+wait_reprocess_queue = Queue.Queue()
+
+def domain_to_ip(dn):
+    try:
+        return socket.gethostbyname(dn),0         # 三级域名即可返回IP
+    except:
+        try:
+            ext = tldextract.extract(dn)
+            return socket.gethostbyname(ext.domain + '.' + ext.suffix),1    # 二级域名返回IP
+        except:
+            try:
+                return socket.gethostbyname('www.'+ext.domain + '.' + ext.suffix),2       # 前缀www.返回IP
+            except:
+                return ''
+    
+    
+def ip_to_location(ip):
+    print "Converting ip >>>", ip
+    ip = str(ip)
+    querys = 'ip=' + ip
+    url = host + path + '?' + querys
+    request = urllib2.Request(url)
+    request.add_header('Authorization', 'APPCODE ' + appcode)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    response = urllib2.urlopen(request, context=ctx)
+    temp = response.read()
+    # print temp.decode('utf-8').encode('gbk')
+    return temp
+
+
+def callback(ch, method, properties, dn):
+    print " [x] Processing domain : %r" % dn
+
+    temp_ip, category = domain_to_ip(dn)
+    if category == 2:                                   # 原始域名 二级域名 和www.二级域名均未返回DNS响应
+        try:                                            # 抓取ip查询地域API的报错
+            api_response = ip_to_location(temp_ip)
+        except Exception as e:
+            print "ip_to_location 异常 开始 -----------"
+            print e
+            print "re inserting dn : ",dn
+            print "ip_to_location 异常 结束 -------------"
+            return
+        try:                                            # 抓取json格式转换错误
+            temp_dict = json.loads(api_response)
+            temp_dict['data'][u'DomainName'] = dn
+            pre_insert = temp_dict['data']
+            print pre_insert
+            r.table('Domain2Location').insert(pre_insert).run(conn)
+            ch.basic_ack( delivery_tag = method.delivery_tag )
+        except Exception as e:
+            print "json loads 异常 开始 ---------------------"
+            print e
+            print "re inserting dn : ",dn
+            print "json loads 异常 结束 ----------------"
+            return
+    else:
+        pre_insert = {u'ip': u'', u'city': u'', u'area_id': u'', u'region_id': u'', u'area': u'', u'city_id': u'', u'country': u'',
+                      u'region': u'', u'isp': u'', u'country_id': u'CN', u'county': u'', u'isp_id': u'', u'county_id': u'', u'DomainName': dn}
+        print 'No IP',pre_insert
+        r.table('Domain2Location').insert(pre_insert).run(conn)
+        ch.basic_ack( delivery_tag = method.delivery_tag )
+
+
+
+
+if __name__ == "__main__":
+    conn = r.connect(host='172.16.1.2', db='IP')
+    credentials = pika.PlainCredentials('guest', '***REMOVED***')
+    
+
+
+    def start_consume():
+        connection = pika.BlockingConnection(pika.ConnectionParameters('192.168.4.249', 5672, '/', credentials))
+        channel = connection.channel()
+        channel.queue_declare(queue='domain-queue')
+        channel.basic_consume(callback, queue='domain-queue', no_ack=False)
+        channel.start_consuming()
+
+    while True:
+        time.sleep(2)                       # wait 2 seconds before reconnect
+        print '[x] Starting a round of pika processing.'
+        try:
+            start_consume()
+        except Exception as e:
+            print "consuming Exception >>",e
+
+
